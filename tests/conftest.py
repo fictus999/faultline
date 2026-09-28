@@ -1,0 +1,14 @@
+"""Shared test fixtures."""
+
+from collections.abc import Iterator
+
+import pytest
+import structlog
+
+
+@pytest.fixture(autouse=True)
+def _reset_structlog() -> Iterator[None]:
+    """Keep logging configuration from leaking between tests."""
+    yield
+    structlog.reset_defaults()
+    structlog.contextvars.clear_contextvars()
