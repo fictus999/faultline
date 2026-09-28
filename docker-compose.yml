@@ -1,0 +1,118 @@
+# Faultline: four product processes (collector, detector, notifier, api), the loadgen
+# demo harness, Redis Streams and Postgres. Secrets and AWS settings come from .env.
+
+x-app: &app
+  build: .
+  image: faultline:dev
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  environment: &app-env
+    FAULTLINE_REDIS_URL: redis://redis:6379/0
+    FAULTLINE_DATABASE_URL: postgresql://faultline:faultline@postgres:5432/faultline
+    FAULTLINE_LOG_PATH: /var/log/faultline/app.log
+    FAULTLINE_SINKS: ${FAULTLINE_SINKS:-log,webhook}
+    FAULTLINE_WEBHOOK_URL: ${FAULTLINE_WEBHOOK_URL:-http://api:8080/api/demo/webhook-receiver}
+    FAULTLINE_WEBHOOK_SECRET: ${FAULTLINE_WEBHOOK_SECRET:-change-me-before-the-demo}
+    FAULTLINE_DEMO_MODE: "1"
+  depends_on:
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: faultline
+      POSTGRES_PASSWORD: faultline
+      POSTGRES_DB: faultline
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faultline -d faultline"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  loadgen:
+    <<: *app
+    command: ["python", "tools/loadgen/loadgen.py"]
+    volumes:
+      - applogs:/var/log/faultline
+
+  collector:
+    <<: *app
+    command: ["faultline", "collector"]
+    volumes:
+      - applogs:/var/log/faultline
+
+  detector:
+    <<: *app
+    command: ["faultline", "detector"]
+
+  notifier:
+    <<: *app
+    command: ["faultline", "notifier"]
+
+  api:
+    <<: *app
+    command: ["faultline", "api"]
+    environment:
+      <<: *app-env
+      FAULTLINE_API_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  # Optional: docker compose --profile observability up -d
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["observability"]
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: ["observability"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./observability/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  # Optional downstream human workflow (n8n only consumes alerts): make n8n
+  n8n:
+    image: n8nio/n8n:1.123.82
+    profiles: ["n8n"]
+    environment:
+      FAULTLINE_WEBHOOK_SECRET: ${FAULTLINE_WEBHOOK_SECRET:-change-me-before-the-demo}
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+    volumes:
+      - n8ndata:/home/node/.n8n
+      - ./integrations/n8n:/workflows:ro
+    ports:
+      - "127.0.0.1:5678:5678"
+
+volumes:
+  applogs:
+  pgdata:
+  n8ndata:
