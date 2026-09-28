@@ -1,0 +1,42 @@
+# Faultline watching itself. Each alert links to its runbook entry in docs/runbook.md.
+groups:
+  - name: faultline-self
+    rules:
+      - alert: FaultlineDetectorStale
+        expr: faultline_detector_stats_age_seconds > 5
+        for: 30s
+        labels:
+          severity: page
+        annotations:
+          summary: The detector has not evaluated for over 5 s (freshness SLO)
+          runbook: docs/runbook.md#detector-stale
+      - alert: FaultlineScrapeDown
+        expr: up{job="faultline"} == 0
+        for: 30s
+        labels:
+          severity: page
+        annotations:
+          summary: Prometheus cannot scrape the Faultline API (API or Postgres down)
+          runbook: docs/runbook.md#detector-stale
+      - alert: FaultlineOutboxBacklog
+        expr: faultline_outbox_oldest_age_seconds > 60
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: An alert event has waited over 60 s for delivery
+          runbook: docs/runbook.md#outbox-backlog
+      - alert: FaultlineDeadLetters
+        expr: faultline_deliveries{status="dead"} > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: Deliveries used all 8 attempts and were dead-lettered
+          runbook: docs/runbook.md#dead-letters
+      - alert: FaultlineLinesLost
+        expr: delta(faultline_lines_lost[5m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: Sequence gaps show log lines that never reached the detector
+          runbook: docs/runbook.md#lines-lost

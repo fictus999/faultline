@@ -1,0 +1,145 @@
+{
+  "id": "faultlineIntake1",
+  "name": "Faultline alert intake",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "nodes": [
+    {
+      "id": "3b7e3c1e-5d0a-4b8e-9f51-6c0f1d2a0001",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -300
+      ],
+      "parameters": {
+        "content": "## Faultline alert intake\nFaultline's notifier POSTs every alert event (CREATED, ESCALATED, RESOLVED) here, signed with HMAC-SHA256.\n\n1. Verify the signature and reject timestamps older than 300 s (replays).\n2. Dedupe by `event_id`: delivery is at-least-once, so retries arrive twice.\n3. Route to people: page on CRITICAL, open an incident on HIGH, close on RESOLVED.\n\nConnect Slack, PagerDuty or Jira credentials to the hand-off node.",
+        "height": 260,
+        "width": 520
+      }
+    },
+    {
+      "id": "3b7e3c1e-5d0a-4b8e-9f51-6c0f1d2a0002",
+      "name": "Faultline webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "7c1f5a9e-2b4d-4c3a-8e6f-1a2b3c4d0002",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "faultline",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      }
+    },
+    {
+      "id": "3b7e3c1e-5d0a-4b8e-9f51-6c0f1d2a0003",
+      "name": "Verify signature and dedupe",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Faultline delivers at-least-once. Verify the HMAC, reject replays, dedupe by event_id.\nconst crypto = require('crypto');\nconst MAX_SKEW_SECONDS = 300;\nconst DEDUPE_SECONDS = 3600;\n\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst ts = String(headers['x-faultline-timestamp'] || '');\nconst signature = String(headers['x-faultline-signature'] || '');\nconst secret = $env.FAULTLINE_WEBHOOK_SECRET || '';\nconst now = Math.floor(Date.now() / 1000);\nconst reject = (reason) => [{ json: { status: 'rejected', http: 401, reason } }];\n\nlet raw;\ntry {\n  raw = await this.helpers.getBinaryDataBuffer(0, 'data');\n} catch (error) {\n  raw = Buffer.from((item.binary && item.binary.data && item.binary.data.data) || '', 'base64');\n}\n\nif (!secret) return reject('FAULTLINE_WEBHOOK_SECRET is not set for n8n');\nif (!/^\\d+$/.test(ts) || Math.abs(now - Number(ts)) > MAX_SKEW_SECONDS) {\n  return reject('missing or stale timestamp');\n}\nconst expected = Buffer.from(\n  'sha256=' +\n    crypto.createHmac('sha256', secret).update(Buffer.concat([Buffer.from(ts + '.'), raw])).digest('hex'),\n);\nconst given = Buffer.from(signature);\nif (expected.length !== given.length || !crypto.timingSafeEqual(expected, given)) {\n  return reject('bad signature');\n}\n\nconst event = JSON.parse(raw.toString('utf8'));\nconst store = $getWorkflowStaticData('global');\nstore.seen = store.seen || {};\nfor (const [id, at] of Object.entries(store.seen)) {\n  if (now - at > DEDUPE_SECONDS) delete store.seen[id];\n}\nconst duplicate = Object.prototype.hasOwnProperty.call(store.seen, event.event_id);\nif (!duplicate) store.seen[event.event_id] = now;\n\nreturn [{ json: { ...event, status: duplicate ? 'duplicate' : 'accepted', http: 200 } }];\n"
+      }
+    },
+    {
+      "id": "3b7e3c1e-5d0a-4b8e-9f51-6c0f1d2a0004",
+      "name": "Respond to Faultline",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: $json.status, event_id: $json.event_id, reason: $json.reason }) }}",
+        "options": {
+          "responseCode": "={{ $json.http }}"
+        }
+      }
+    },
+    {
+      "id": "3b7e3c1e-5d0a-4b8e-9f51-6c0f1d2a0005",
+      "name": "Route by severity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Only new, verified events reach people. Faultline stays the source of truth.\nconst pct = (x) => (100 * (x || 0)).toFixed(1) + '%';\nconst out = [];\nfor (const item of $input.all()) {\n  const e = item.json;\n  if (e.status !== 'accepted') continue;\n  const m = e.metrics || {};\n  let action = 'notify_channel';\n  if (e.type === 'RESOLVED') action = 'close_incident';\n  else if (e.severity === 'CRITICAL') action = 'page_on_call';\n  else if (e.severity === 'HIGH') action = 'open_incident';\n  const message =\n    e.type === 'RESOLVED'\n      ? `RESOLVED ${e.service}: error rate back to ${pct(m.error_rate_short)}`\n      : `${e.severity} ${e.service}: error rate ${pct(m.error_rate_short)} vs baseline ` +\n        `${pct(m.baseline)}, burn ${m.burn_short}x, z=${m.z}`;\n  out.push({\n    json: {\n      action,\n      message,\n      event_id: e.event_id,\n      alert_id: e.alert_id,\n      type: e.type,\n      service: e.service,\n      severity: e.severity,\n    },\n  });\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "3b7e3c1e-5d0a-4b8e-9f51-6c0f1d2a0006",
+      "name": "Hand-off (connect Slack, PagerDuty or Jira)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        960,
+        0
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Faultline webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify signature and dedupe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify signature and dedupe": {
+      "main": [
+        [
+          {
+            "node": "Respond to Faultline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Faultline": {
+      "main": [
+        [
+          {
+            "node": "Route by severity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by severity": {
+      "main": [
+        [
+          {
+            "node": "Hand-off (connect Slack, PagerDuty or Jira)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
